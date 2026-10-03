@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>IELTS Live Speaking</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  body{margin:0;font-family:system-ui,sans-serif;background:#14141c;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:16px;box-sizing:border-box}
+  #mic{width:140px;height:140px;border-radius:50%;border:0;background:#e8895a;font-size:56px;cursor:pointer;box-shadow:0 0 0 14px #3a2a22}
+  #mic.live{background:#3fb97a;box-shadow:0 0 0 14px #1f3a2c}
+  h2{margin:26px 0 8px} p{color:#aaa;max-width:420px;margin:4px 0}
+  #q{background:#22222e;border-radius:12px;padding:14px;margin-top:16px;max-width:420px;display:none}
+  .row{display:flex;gap:10px;margin-top:18px}
+  .row button{background:#2a2a38;color:#fff;border:0;border-radius:10px;padding:11px 16px;font-size:15px;cursor:pointer}
+  .row button.on{background:#e8895a} .row button.red{background:#c0392b}
+</style>
+</head>
+<body>
+<div class="row" id="modes">
+  <button id="m-pair">1-on-1</button>
+  <button id="m-group">Group (5-6)</button>
+</div>
+<br>
+<button id="mic">🎙</button>
+<h2 id="title">Tap to start talking</h2>
+<p id="sub">We'll connect you with others to practice with.</p>
+<p id="count"></p>
+<p id="dbg" style="font-size:13px;color:#8ab"></p>
+<div id="q"></div>
+<div class="row" id="ctrl" style="display:none">
+  <button id="snd">🔊 Ovoz</button>
+  <button id="mute">🔇 Mute</button>
+  <button id="leave" class="red">Leave</button>
+</div>
+
+<script>
+const tg = window.Telegram && Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const $ = id => document.getElementById(id);
+let mode = new URLSearchParams(location.search).get('mode') === 'group' ? 'group' : 'pair';
+let ws, stream, active = false;
+const pcs = {}, pend = {}, auds = {};
+let ICE = [{urls: 'stun:stun.l.google.com:19302'}];
+
+function setMode(m) {
+  if (active) return;
+  mode = m;
+  $('m-pair').classList.toggle('on', m === 'pair');
+  $('m-group').classList.toggle('on', m === 'group');
+}
+function ui(title, sub, live) {
+  $('title').textContent = title; $('sub').textContent = sub;
+  $('mic').classList.toggle('live', !!live);
+}
+const sendJson = o => ws.send(JSON.stringify(o));
+const sendSig = (k, data) => sendJson({type: 'signal', to: k === 'p' ? undefined : k, data});
+
+async function start() {
+  if (active) return;
+  try { stream = await navigator.mediaDevices.getUserMedia({audio: true}); }
+  catch (e) { ui('Microphone blocked', 'Allow microphone access and try again.'); return; }
+  active = true;
+  $('ctrl').style.display = 'flex'; $('modes').style.display = 'none';
+  ui('Searching...', mode === 'group' ? 'Joining a debate room' : 'Looking for a partner');
+  try { ICE = await (await fetch('/ice')).json(); } catch (e) {}
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => sendJson({type: 'join', mode});
+  ws.onmessage = async ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'matched') {
+      showQ('❓ ' + m.question); ui('Connected!', 'Speak now.', true);
+      await makePc('p', m.role === 'caller');
+    } else if (m.type === 'group_joined') {
+      showQ('📌 ' + m.topic); ui('Debate room', 'Speak in turns. Be respectful.', true);
+      $('count').textContent = '👥 ' + m.count + '/6';
+      for (const id of m.peers) await makePc(id, true);
+    } else if (m.type === 'peer_joined') {
+      $('count').textContent = '👥 ' + m.count + '/6';
+    } else if (m.type === 'signal') {
+      await onSignal(m.from || 'p', m.data);
+    } else if (m.type === 'peer_left') {
+      if (m.id) { closePc(m.id); $('count').textContent = '👥 ' + m.count + '/6'; }
+      else { reset('Partner left', 'Choose a mode and tap the mic again.'); }
+    }
+  };
+  ws.onclose = () => { if (active) reset('Disconnected', 'Tap the mic to try again.'); };
+}
+
+function showQ(t) { $('q').style.display = 'block'; $('q').textContent = t; }
+
+async function makePc(k, caller) {
+  const pc = new RTCPeerConnection({iceServers: ICE});
+  pc.oniceconnectionstatechange = () => { $('dbg').textContent = 'Aloqa (' + k + '): ' + pc.iceConnectionState; };
+  pcs[k] = pc; pend[k] = [];
+  stream.getTracks().forEach(t => pc.addTrack(t, stream));
+  pc.ontrack = e => {
+    let a = auds[k];
+    if (!a) { a = document.createElement('audio'); a.autoplay = true; a.playsInline = true; document.body.appendChild(a); auds[k] = a; }
+    a.srcObject = e.streams[0]; a.play().catch(() => {});
+  };
+  pc.onicecandidate = e => { if (e.candidate) sendSig(k, {candidate: e.candidate}); };
+  if (caller) {
+    await pc.setLocalDescription(await pc.createOffer());
+    sendSig(k, {sdp: pc.localDescription});
+  }
+  return pc;
+}
+
+async function onSignal(k, d) {
+  const pc = pcs[k] || await makePc(k, false);
+  if (d.sdp) {
+    await pc.setRemoteDescription(d.sdp);
+    for (const c of pend[k]) await pc.addIceCandidate(c);
+    pend[k] = [];
+    if (d.sdp.type === 'offer') {
+      await pc.setLocalDescription(await pc.createAnswer());
+      sendSig(k, {sdp: pc.localDescription});
+    }
+  } else if (d.candidate) {
+    if (pc.remoteDescription) await pc.addIceCandidate(d.candidate); else pend[k].push(d.candidate);
+  }
+}
+
+function closePc(k) {
+  if (pcs[k]) { pcs[k].close(); delete pcs[k]; }
+  if (auds[k]) { auds[k].remove(); delete auds[k]; }
+  delete pend[k];
+}
+
+function reset(title, sub) {
+  Object.keys(pcs).forEach(closePc);
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (ws) { try { ws.close(); } catch (e) {} }
+  active = false;
+  $('ctrl').style.display = 'none'; $('modes').style.display = 'flex';
+  $('q').style.display = 'none'; $('count').textContent = '';
+  ui(title, sub);
+}
+
+$('snd').onclick = () => Object.values(auds).forEach(a => a.play());
+$('mic').onclick = start;
+$('m-pair').onclick = () => setMode('pair');
+$('m-group').onclick = () => setMode('group');
+$('leave').onclick = () => {
+  if (ws && ws.readyState === 1) sendJson({type: 'leave'});
+  reset('Tap to start talking', "We'll connect you with others to practice with.");
+};
+$('mute').onclick = () => {
+  if (!stream) return;
+  const t = stream.getAudioTracks()[0]; t.enabled = !t.enabled;
+  $('mute').textContent = t.enabled ? '🔇 Mute' : '🎙 Unmute';
+};
+setMode(mode);
+</script>
+</body>
+</html>
